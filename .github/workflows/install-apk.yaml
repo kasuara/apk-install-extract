@@ -5,51 +5,57 @@ on:
   push:
     branches:
       - main
-  schedule:
-    - cron: '30 5,15 * * *'
-    
   workflow_dispatch:
     inputs:
       apk_zip_url:
         description: 'url to download apks zipped'
-        required: true
+        required: false
         type: string
-        default: https://url/apks.zip
+        default: 'https://github.com/kasuara/apk-install-extract/releases/download/v1.0.0/wa_bundle_7z.zip'
       run_name:
         required: false
         type: string
+
 env:
   avd_port: 9999
   avd_name: localhost:9999
-  default_apk_zip_url: https://github.com/clearbluejar/apk-install/releases/download/v0.0.1/example.apk.zip
+  default_apk_zip_url: https://github.com/kasuara/apk-install-extract/releases/download/v1.0.0/wa_bundle_7z.zip
   all_apk_dir: all_apks
 
 jobs:
-  generate-matrix:    
-    runs-on: ubuntu-latest    
+  generate-matrix:
+    runs-on: ubuntu-latest
     outputs:
       apkpaths: ${{ steps.getpaths.outputs.apkpaths }}
-    steps:      
+    steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
       - uses: actions/setup-python@v4
         with:
           python-version: '3.10'
+
+      - name: Install p7zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full unzip wget
+
       - name: Download and unzip APKs
         run: |
-          mkdir ${{env.all_apk_dir}}          
-          # worfklow_dispatch
-          [ -n "${{inputs.apk_zip_url}}" ] && wget ${{inputs.apk_zip_url}} -O ${{env.all_apk_dir}}.zip
-          # default run
-          [ -z "${{inputs.apk_zip_url}}" ] && wget ${{env.default_apk_zip_url}} -O ${{env.all_apk_dir}}.zip
+          mkdir ${{env.all_apk_dir}}
+          [ -n "${{inputs.apk_zip_url}}" ] && wget "${{inputs.apk_zip_url}}" -O ${{env.all_apk_dir}}.zip
+          [ -z "${{inputs.apk_zip_url}}" ] && wget "${{env.default_apk_zip_url}}" -O ${{env.all_apk_dir}}.zip
           unzip ${{env.all_apk_dir}}.zip -d ${{env.all_apk_dir}}
-          find .
+          find ${{env.all_apk_dir}} -type f -name "*.7z" -exec 7z x {} -o${{env.all_apk_dir}} -y \;
+          find ${{env.all_apk_dir}}
+          ls -la ${{env.all_apk_dir}}
 
       - name: Setup paths
         id: getpaths
-        run: |                              
-          echo "apkpaths=$(python -c 'import pathlib; print([str(file) for file in pathlib.Path.glob(pathlib.Path("${{env.all_apk_dir}}"),"**/*.apk")])')" >> "$GITHUB_OUTPUT"          
+        run: |
+          echo "apkpaths=$(python -c 'import pathlib; print([str(file) for file in pathlib.Path.glob(pathlib.Path("${{env.all_apk_dir}}"),"**/*.apk")])')" >> "$GITHUB_OUTPUT"
         shell: bash
+
       - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
@@ -62,84 +68,83 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:        
+      matrix:
         apkpath: ${{fromJson(needs.generate-matrix.outputs.apkpaths)}}
-        arch: ['arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64']        
+        arch: ['arm64-v8a']
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name : install adb
-        run: | 
-          sudo apt install adb aapt
+
+      - name: install adb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y adb aapt
+
       - name: Install reDroid dependencies
         run: |
-          ## install required kernel modules          
-          sudo apt install linux-modules-extra-`uname -r`
-          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
-          #sudo modprobe ashmem_linux          
+          sudo apt-get install -y linux-modules-extra-`uname -r`
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || true
+
       - name: Run emulator
         run: |
           mkdir data
-          docker run -itd --rm --privileged --pull always -v $(pwd)/data:/data -p ${{env.avd_port}}:5555 redroid/redroid:12.0.0-latest          
+          docker run -itd --rm --privileged --pull always -v $(pwd)/data:/data -p ${{env.avd_port}}:5555 redroid/redroid:12.0.0-latest
+          sleep 20
 
-      - name: Download runner artifacts 
+      - name: Download runner artifacts
         uses: actions/download-artifact@v4
         with:
           name: ${{env.all_apk_dir}}
           path: ${{env.all_apk_dir}}
-        
 
       - name: adb connect install
-        run: |                    
+        run: |
           adb connect ${{env.avd_name}}
-          adb devices -l 
+          adb devices -l
           adb -s ${{env.avd_name}} install --abi ${{matrix.arch}} "${{matrix.apkpath}}"
-          
+
       - name: adb start main activity
-        run: |                    
-          # adb -s localhost:5555 shell am start -n com.whatsapp/com.whatsapp.Main          
+        run: |
           ./adb-run.sh "${{matrix.apkpath}}"
+          sleep 120
 
       - name: get package name ver
-        run : |
+        run: |
           echo "apkpkgver=$(./get-pkgver.sh '${{matrix.apkpath}}')" >> "$GITHUB_ENV"
           echo "apkpkg=$(./get-pkg.sh '${{matrix.apkpath}}')" >> "$GITHUB_ENV"
-          echo "$apkpkgver"         
-          echo "$apkpkg"     
 
       - name: create output dir
-        run: | 
+        run: |
           mkdir ${{ env.apkpkgver }}
 
       - name: aapt dump badging
-        run: | 
-          aapt dump badging "${{matrix.apkpath}}" >  ${{ env.apkpkgver }}/${{ env.apkpkgver }}.badging.txt         
+        run: |
+          aapt dump badging "${{matrix.apkpath}}" > ${{ env.apkpkgver }}/${{ env.apkpkgver }}.badging.txt
           cat ${{ env.apkpkgver }}/${{ env.apkpkgver }}.badging.txt
-      
+
       - name: fix data permissions
         if: always()
-        run: | 
-          # stop docker containers
-          docker stop $(docker ps -a -q)
-          sudo chown -R runner:runner data
+        run: |
+          docker stop $(docker ps -a -q) || true
+          sudo chown -R runner:runner data || true
 
       - name: compress archive data
         run: |
-          mv data data-${{ env.apkpkgver }}-${{matrix.arch}} 
+          mv data data-${{ env.apkpkgver }}-${{matrix.arch}}
           tar cvzf ${{ env.apkpkgver }}/${{ env.apkpkgver }}.${{matrix.arch}}.data.tar.gz data-${{ env.apkpkgver }}-${{matrix.arch}}/data/${{ env.apkpkg }}
-      
+
       - name: Upload data
         uses: actions/upload-artifact@v4
         if: always()
         with:
-            name: all_package_data
-            path: ${{ env.apkpkgver }}
-            retention-days: 25
-            
+          name: all_package_data
+          path: ${{ env.apkpkgver }}
+          retention-days: 25
+
       - name: Upload all data
         uses: actions/upload-artifact@v4
         if: always()
         with:
-            name: all_data
-            path: data-${{ env.apkpkgver }}-${{matrix.arch}}/data/
-            retention-days: 5
+          name: all_data
+          path: data-${{ env.apkpkgver }}-${{matrix.arch}}/data/
+          retention-days: 5
