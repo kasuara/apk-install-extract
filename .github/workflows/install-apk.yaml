@@ -2,16 +2,8 @@ name: Install Extract APK
 run-name: Install Extract - ${{inputs.run_name}}
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
-      apk_zip_url:
-        description: 'url to download apks zipped'
-        required: false
-        type: string
-        default: 'https://github.com/kasuara/apk-install-extract/releases/download/v1.0.0/wa_bundle_7z.zip'
       run_name:
         required: false
         type: string
@@ -19,132 +11,74 @@ on:
 env:
   avd_port: 9999
   avd_name: localhost:9999
-  default_apk_zip_url: https://github.com/kasuara/apk-install-extract/releases/download/v1.0.0/wa_bundle_7z.zip
+  wa_bundle_url: https://github.com/kasuara/apk-install-extract/releases/download/v1.0.0/wa_bundle_7z.zip
   all_apk_dir: all_apks
 
 jobs:
-  generate-matrix:
+  install-and-extract:
     runs-on: ubuntu-latest
-    outputs:
-      apkpaths: ${{ steps.getpaths.outputs.apkpaths }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
-      - name: Install p7zip
+      - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y p7zip-full unzip wget
-
-      - name: Download and unzip APKs
-        run: |
-          mkdir ${{env.all_apk_dir}}
-          [ -n "${{inputs.apk_zip_url}}" ] && wget "${{inputs.apk_zip_url}}" -O ${{env.all_apk_dir}}.zip
-          [ -z "${{inputs.apk_zip_url}}" ] && wget "${{env.default_apk_zip_url}}" -O ${{env.all_apk_dir}}.zip
-          unzip ${{env.all_apk_dir}}.zip -d ${{env.all_apk_dir}}
-          find ${{env.all_apk_dir}} -type f -name "*.7z" -exec 7z x {} -o${{env.all_apk_dir}} -y \;
-          find ${{env.all_apk_dir}}
-          ls -la ${{env.all_apk_dir}}
-
-      - name: Setup paths
-        id: getpaths
-        run: |
-          echo "apkpaths=$(python -c 'import pathlib; print([str(file) for file in pathlib.Path.glob(pathlib.Path("${{env.all_apk_dir}}"),"**/*.apk")])')" >> "$GITHUB_OUTPUT"
-        shell: bash
-
-      - name: Upload APKs
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{env.all_apk_dir}}
-          path: ${{env.all_apk_dir}}
-          retention-days: 15
-
-  download-install-and-extract:
-    needs: generate-matrix
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        apkpath: ${{fromJson(needs.generate-matrix.outputs.apkpaths)}}
-        arch: ['arm64-v8a']
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: install adb
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y adb aapt
+          sudo apt-get install -y adb aapt p7zip-full unzip wget
 
       - name: Install reDroid dependencies
         run: |
-          sudo apt-get install -y linux-modules-extra-`uname -r`
+          sudo apt-get install -y linux-modules-extra-`uname -r` || true
           sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || true
+
+      - name: Download bundle
+        run: |
+          mkdir -p ${{env.all_apk_dir}}
+          wget "${{env.wa_bundle_url}}" -O bundle.zip
+          unzip bundle.zip -d ${{env.all_apk_dir}}
+          find ${{env.all_apk_dir}} -type f -name "*.7z" -exec 7z x {} -o${{env.all_apk_dir}} -y \;
+          ls -la ${{env.all_apk_dir}}
+          find ${{env.all_apk_dir}} -type f -name "*.apk"
 
       - name: Run emulator
         run: |
           mkdir data
           docker run -itd --rm --privileged --pull always -v $(pwd)/data:/data -p ${{env.avd_port}}:5555 redroid/redroid:12.0.0-latest
-          sleep 20
+          sleep 30
 
-      - name: Download runner artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{env.all_apk_dir}}
-          path: ${{env.all_apk_dir}}
-
-      - name: adb connect install
+      - name: adb connect
         run: |
           adb connect ${{env.avd_name}}
           adb devices -l
+          sleep 10
+
+      - name: Install WhatsApp (all splits)
+        run: |
           adb -s ${{env.avd_name}} install-multiple -r ${{env.all_apk_dir}}/*.apk
 
-      - name: adb start main activity
+      - name: Launch WhatsApp
         run: |
-          ./adb-run.sh "${{matrix.apkpath}}"
-          sleep 120
+          adb -s ${{env.avd_name}} shell am start -n com.whatsapp/com.whatsapp.Main || true
+          sleep 180
 
-      - name: get package name ver
-        run: |
-          echo "apkpkgver=$(./get-pkgver.sh '${{matrix.apkpath}}')" >> "$GITHUB_ENV"
-          echo "apkpkg=$(./get-pkg.sh '${{matrix.apkpath}}')" >> "$GITHUB_ENV"
-
-      - name: create output dir
-        run: |
-          mkdir ${{ env.apkpkgver }}
-
-      - name: aapt dump badging
-        run: |
-          aapt dump badging "${{matrix.apkpath}}" > ${{ env.apkpkgver }}/${{ env.apkpkgver }}.badging.txt
-          cat ${{ env.apkpkgver }}/${{ env.apkpkgver }}.badging.txt
-
-      - name: fix data permissions
-        if: always()
+      - name: Extract decompressed libs
         run: |
           docker stop $(docker ps -a -q) || true
           sudo chown -R runner:runner data || true
+          find data -type d -name "decompressed" 2>/dev/null
+          find data -type d -name "libs.spk.zst" 2>/dev/null
+          ls -la data/data/com.whatsapp/files/ 2>/dev/null || echo "no files dir"
 
-      - name: compress archive data
+      - name: Package results
+        if: always()
         run: |
-          mv data data-${{ env.apkpkgver }}-${{matrix.arch}}
-          tar cvzf ${{ env.apkpkgver }}/${{ env.apkpkgver }}.${{matrix.arch}}.data.tar.gz data-${{ env.apkpkgver }}-${{matrix.arch}}/data/${{ env.apkpkg }}
+          tar cvzf whatsapp_decompressed.tar.gz data/ 2>/dev/null || echo "no data"
 
-      - name: Upload data
-        uses: actions/upload-artifact@v4
+      - name: Upload results
         if: always()
-        with:
-          name: all_package_data
-          path: ${{ env.apkpkgver }}
-          retention-days: 25
-
-      - name: Upload all data
         uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: all_data
-          path: data-${{ env.apkpkgver }}-${{matrix.arch}}/data/
-          retention-days: 5
+          name: whatsapp_data
+          path: whatsapp_decompressed.tar.gz
+          retention-days: 30
+          if-no-files-found: warn
